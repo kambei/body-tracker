@@ -85,8 +85,11 @@ YOLO_POSE_MODEL=yolov8s-pose.pt YOLO_IMG_SIZE=640 YOLO_CONF=0.25 python main.py
 ## Project Structure
 ```
 .
-├── main.py        # Tkinter GUI, camera enumeration, video processor thread
-└── README.md      # This file
+├── main.py                # Tkinter GUI, camera enumeration, video processor thread
+├── export_model.py        # Helper to export Ultralytics model to TFLite/ONNX/NCNN (for Android)
+├── docs/
+│   └── ANDROID.md         # Android packaging guide
+└── README.md              # This file
 ```
 
 High‑level code components (see main.py):
@@ -103,6 +106,12 @@ High‑level code components (see main.py):
   - Toggle whether to overlay calories on the video
 
 Note: For advanced users, environment variables still work and can be set before launching the app.
+
+## Android (Packaging)
+Please read the Android packaging guide: docs/ANDROID.md. In short:
+- Tkinter does not run on Android. You cannot package this exact GUI as-is.
+- Recommended: export the YOLO pose model to TFLite/ONNX and build a native Android app (Android Studio) that uses CameraX + a mobile inference runtime (e.g., TFLite). Use export_model.py to create mobile-ready models.
+- Alternative (advanced): port UI to Kivy and package with Buildozer, using TFLite instead of PyTorch.
 
 ## Troubleshooting
 - OpenCV not found or not working:
