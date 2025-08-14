@@ -44,5 +44,5 @@ htmlcov/
 # IDE local history (JetBrains)
 .idea/.idea.local/
 
-saved-tracks/
+saved-tracks/*
 !saved-tracks/.gitkeep
