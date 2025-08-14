@@ -158,7 +158,7 @@ class CameraEnumerator:
 
 
 class VideoProcessor(threading.Thread):
-    def __init__(self, cam_index: int, frame_callback, status_callback, stop_event: threading.Event):
+    def __init__(self, cam_index: int, frame_callback, status_callback, stop_event: threading.Event, *, weight_kg: float = 70.0, activity_met: float = 3.0, overlay_calories: bool = True, active_seconds_provider=None):
         super().__init__(daemon=True)
         self.cam_index = cam_index
         self.frame_callback = frame_callback
@@ -172,6 +172,46 @@ class VideoProcessor(threading.Thread):
         self._writer: Optional[cv2.VideoWriter] = None
         self._is_recording: bool = False
         self._record_path: Optional[str] = None
+        # Motion detection (frame-diff based)
+        self._prev_gray = None
+        self._frames_in_sec = 0
+        self._motion_frames_in_sec = 0
+        # Tuneable thresholds via env vars
+        try:
+            self._motion_pixel_thresh = int(os.environ.get("BT_MOTION_DIFF_THRESH", "15"))
+        except Exception:
+            self._motion_pixel_thresh = 15
+        try:
+            self._motion_ratio_thresh = float(os.environ.get("BT_MOTION_RATIO_THRESH", "0.005"))  # 0.5% pixels
+        except Exception:
+            self._motion_ratio_thresh = 0.005
+        try:
+            self._motion_frames_ratio = float(os.environ.get("BT_MOTION_FRAMES_RATIO", "0.1"))  # 10% of frames in the second
+        except Exception:
+            self._motion_frames_ratio = 0.1
+        # Full-body gating configuration
+        try:
+            self._motion_mode = os.environ.get("BT_MOTION_MODE", "full").strip().lower()
+        except Exception:
+            self._motion_mode = "full"
+        try:
+            self._body_pix_thresh = float(os.environ.get("BT_BODY_PIX_THRESH", "8"))
+        except Exception:
+            self._body_pix_thresh = 8.0
+        # Per-second accumulators for landmark displacements
+        self._upper_disp_sum = 0.0
+        self._lower_disp_sum = 0.0
+        self._body_disp_frames = 0
+        # Previous keypoints for displacement calc
+        self._prev_keypoints = None
+        # Calorie overlay/session
+        self.weight_kg = float(weight_kg)
+        self.activity_met = float(activity_met)
+        self.overlay_calories = bool(overlay_calories)
+        self.session_start_ts = time.time()
+        self.session_active_seconds = 0
+        self._last_move_increment_sec = None
+        self._active_seconds_provider = active_seconds_provider
 
     def start_recording(self, path: str):
         """Start writing frames to the specified video file path.
@@ -269,6 +309,39 @@ class VideoProcessor(threading.Thread):
             last_ts = time.time()
             frame_count = 0
 
+            # Helper to draw calories overlay onto BGR frame
+            def _draw_cal_overlay(img_bgr):
+                if not self.overlay_calories:
+                    return img_bgr
+                try:
+                    h, w = img_bgr.shape[:2]
+                    elapsed = max(0, int(time.time() - self.session_start_ts))
+                    mm = (elapsed % 3600) // 60
+                    ss = elapsed % 60
+                    # Use app-provided active seconds if available for consistency with status bar
+                    if callable(self._active_seconds_provider):
+                        try:
+                            active_sec = max(0, int(self._active_seconds_provider()))
+                        except Exception:
+                            active_sec = max(0, int(self.session_active_seconds))
+                    else:
+                        active_sec = max(0, int(self.session_active_seconds))
+                    kcal = self.activity_met * self.weight_kg * (active_sec / 3600.0)
+                    text = f"Elapsed {mm:02d}:{ss:02d} | {kcal:.1f} kcal"
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    scale = 0.7
+                    thickness = 2
+                    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+                    x, y = 10, 10 + th
+                    # background box
+                    cv2.rectangle(img_bgr, (x-8, y-th-8), (x-8+tw+16, y+8), (0, 0, 0), thickness=-1)
+                    # text with slight shadow
+                    cv2.putText(img_bgr, text, (x+1, y+1), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+                    cv2.putText(img_bgr, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                except Exception:
+                    pass
+                return img_bgr
+
             if use_mediapipe:
                 mp_pose = mp.solutions.pose
                 mp_holistic = mp.solutions.holistic
@@ -331,6 +404,22 @@ class VideoProcessor(threading.Thread):
                                 for pt in (ls_xy, rs_xy, lh_xy, rh_xy, mid_shoulder, mid_hip):
                                     cv2.circle(disp, pt, 5, (0, 0, 255), thickness=-1, lineType=cv2.LINE_AA)
                                     cv2.circle(disp, pt, 3, (0, 0, 255), thickness=-1, lineType=cv2.LINE_AA)
+
+                                # Update full-body displacement accumulators for this frame (MediaPipe)
+                                try:
+                                    kp = {'ls': ls_xy, 'rs': rs_xy, 'lh': lh_xy, 'rh': rh_xy}
+                                    if self._prev_keypoints is not None:
+                                        import math
+                                        def dist(a, b):
+                                            return math.hypot(float(a[0]-b[0]), float(a[1]-b[1]))
+                                        upper = 0.5 * (dist(kp['ls'], self._prev_keypoints['ls']) + dist(kp['rs'], self._prev_keypoints['rs']))
+                                        lower = 0.5 * (dist(kp['lh'], self._prev_keypoints['lh']) + dist(kp['rh'], self._prev_keypoints['rh']))
+                                        self._upper_disp_sum += upper
+                                        self._lower_disp_sum += lower
+                                        self._body_disp_frames += 1
+                                    self._prev_keypoints = kp
+                                except Exception:
+                                    pass
                             except Exception:
                                 # If any index is missing or conversion fails, skip custom lines
                                 pass
@@ -398,6 +487,22 @@ class VideoProcessor(threading.Thread):
                         # Convert to Tkinter-compatible PNG via memory (avoid PIL dependency)
                         try:
                             bgr = cv2.cvtColor(disp, cv2.COLOR_RGB2BGR)
+                            # Calories overlay
+                            bgr = _draw_cal_overlay(bgr)
+                            # Motion detection update (use displayed BGR)
+                            try:
+                                small = cv2.resize(bgr, (320, 180))
+                                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                                if self._prev_gray is not None:
+                                    diff = cv2.absdiff(gray, self._prev_gray)
+                                    _, thr = cv2.threshold(diff, self._motion_pixel_thresh, 255, cv2.THRESH_BINARY)
+                                    motion_ratio = float(np.count_nonzero(thr)) / float(thr.size)
+                                    if motion_ratio > self._motion_ratio_thresh:
+                                        self._motion_frames_in_sec += 1
+                                self._frames_in_sec += 1
+                                self._prev_gray = gray
+                            except Exception:
+                                pass
                             # Write to video file if recording
                             with self._record_lock:
                                 if self._is_recording and self._writer is not None:
@@ -417,7 +522,26 @@ class VideoProcessor(threading.Thread):
                         now = time.time()
                         if now - last_ts >= 1.0:
                             fps = frame_count / (now - last_ts)
-                            self.status_callback(f"Streaming from camera {self.cam_index} - {fps:.1f} FPS")
+                            try:
+                                moving_second = (self._motion_frames_in_sec / max(1, self._frames_in_sec)) > self._motion_frames_ratio
+                            except Exception:
+                                moving_second = False
+                            # Optional full-body gate (requires both upper and lower body displacement)
+                            try:
+                                if self._motion_mode in ("full", "strict") and self._body_disp_frames > 0:
+                                    upper_avg = self._upper_disp_sum / max(1, self._body_disp_frames)
+                                    lower_avg = self._lower_disp_sum / max(1, self._body_disp_frames)
+                                    body_ok = (upper_avg >= self._body_pix_thresh) and (lower_avg >= self._body_pix_thresh)
+                                    moving_second = moving_second and body_ok
+                            except Exception:
+                                pass
+                            self.status_callback(f"Streaming from camera {self.cam_index} - {fps:.1f} FPS | MOVE={'1' if moving_second else '0'}")
+                            # reset second counters
+                            self._frames_in_sec = 0
+                            self._motion_frames_in_sec = 0
+                            self._upper_disp_sum = 0.0
+                            self._lower_disp_sum = 0.0
+                            self._body_disp_frames = 0
                             last_ts = now
                             frame_count = 0
             elif use_yolo:
@@ -463,9 +587,40 @@ class VideoProcessor(threading.Thread):
                                     cv2.line(disp_bgr, mid_shoulder, mid_hip, (0, 0, 255), 4, lineType=cv2.LINE_AA)
                                     for pt in (ls_xy, rs_xy, lh_xy, rh_xy, mid_shoulder, mid_hip):
                                         cv2.circle(disp_bgr, pt, 5, (0, 0, 255), thickness=-1, lineType=cv2.LINE_AA)
+                                    # Update full-body displacement accumulators for this frame (YOLO)
+                                    try:
+                                        kp = {'ls': ls_xy, 'rs': rs_xy, 'lh': lh_xy, 'rh': rh_xy}
+                                        if self._prev_keypoints is not None:
+                                            import math
+                                            def dist(a, b):
+                                                return math.hypot(float(a[0]-b[0]), float(a[1]-b[1]))
+                                            upper = 0.5 * (dist(kp['ls'], self._prev_keypoints['ls']) + dist(kp['rs'], self._prev_keypoints['rs']))
+                                            lower = 0.5 * (dist(kp['lh'], self._prev_keypoints['lh']) + dist(kp['rh'], self._prev_keypoints['rh']))
+                                            self._upper_disp_sum += upper
+                                            self._lower_disp_sum += lower
+                                            self._body_disp_frames += 1
+                                        self._prev_keypoints = kp
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
 
+                        # Calories overlay
+                        disp_bgr = _draw_cal_overlay(disp_bgr)
+                        # Motion detection update (use displayed BGR)
+                        try:
+                            small = cv2.resize(disp_bgr, (320, 180))
+                            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                            if self._prev_gray is not None:
+                                diff = cv2.absdiff(gray, self._prev_gray)
+                                _, thr = cv2.threshold(diff, self._motion_pixel_thresh, 255, cv2.THRESH_BINARY)
+                                motion_ratio = float(np.count_nonzero(thr)) / float(thr.size)
+                                if motion_ratio > self._motion_ratio_thresh:
+                                    self._motion_frames_in_sec += 1
+                            self._frames_in_sec += 1
+                            self._prev_gray = gray
+                        except Exception:
+                            pass
                         # Write to video if recording and send to UI as PNG
                         with self._record_lock:
                             if self._is_recording and self._writer is not None:
@@ -481,6 +636,20 @@ class VideoProcessor(threading.Thread):
                     except Exception:
                         # If YOLO processing fails, do a simple pass-through for this frame
                         try:
+                            # Update motion on raw frame as fallback
+                            try:
+                                small = cv2.resize(frame, (320, 180))
+                                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                                if self._prev_gray is not None:
+                                    diff = cv2.absdiff(gray, self._prev_gray)
+                                    _, thr = cv2.threshold(diff, self._motion_pixel_thresh, 255, cv2.THRESH_BINARY)
+                                    motion_ratio = float(np.count_nonzero(thr)) / float(thr.size)
+                                    if motion_ratio > self._motion_ratio_thresh:
+                                        self._motion_frames_in_sec += 1
+                                self._frames_in_sec += 1
+                                self._prev_gray = gray
+                            except Exception:
+                                pass
                             success, buf = cv2.imencode('.png', frame)
                             if success:
                                 png_bytes = buf.tobytes()
@@ -493,7 +662,26 @@ class VideoProcessor(threading.Thread):
                     now = time.time()
                     if now - last_ts >= 1.0:
                         fps = frame_count / (now - last_ts)
-                        self.status_callback(f"Streaming from camera {self.cam_index} - {fps:.1f} FPS")
+                        try:
+                            moving_second = (self._motion_frames_in_sec / max(1, self._frames_in_sec)) > self._motion_frames_ratio
+                        except Exception:
+                            moving_second = False
+                        # Optional full-body gate (requires both upper and lower body displacement)
+                        try:
+                            if self._motion_mode in ("full", "strict") and self._body_disp_frames > 0:
+                                upper_avg = self._upper_disp_sum / max(1, self._body_disp_frames)
+                                lower_avg = self._lower_disp_sum / max(1, self._body_disp_frames)
+                                body_ok = (upper_avg >= self._body_pix_thresh) and (lower_avg >= self._body_pix_thresh)
+                                moving_second = moving_second and body_ok
+                        except Exception:
+                            pass
+                        self.status_callback(f"Streaming from camera {self.cam_index} - {fps:.1f} FPS | MOVE={'1' if moving_second else '0'}")
+                        # reset second counters
+                        self._frames_in_sec = 0
+                        self._motion_frames_in_sec = 0
+                        self._upper_disp_sum = 0.0
+                        self._lower_disp_sum = 0.0
+                        self._body_disp_frames = 0
                         last_ts = now
                         frame_count = 0
             else:
@@ -505,19 +693,31 @@ class VideoProcessor(threading.Thread):
                         time.sleep(0.05)
                         continue
 
-                    # Convert BGR to RGB for display
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
                     try:
-                        # Write to video file if recording using the original BGR frame
+                        # Motion detection update (use original BGR frame)
+                        try:
+                            small = cv2.resize(frame, (320, 180))
+                            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                            if self._prev_gray is not None:
+                                diff = cv2.absdiff(gray, self._prev_gray)
+                                _, thr = cv2.threshold(diff, self._motion_pixel_thresh, 255, cv2.THRESH_BINARY)
+                                motion_ratio = float(np.count_nonzero(thr)) / float(thr.size)
+                                if motion_ratio > self._motion_ratio_thresh:
+                                    self._motion_frames_in_sec += 1
+                            self._frames_in_sec += 1
+                            self._prev_gray = gray
+                        except Exception:
+                            pass
+                        # Overlay calories on the BGR frame
+                        frame = _draw_cal_overlay(frame)
+                        # Write to video file if recording using the overlaid BGR frame
                         with self._record_lock:
                             if self._is_recording and self._writer is not None:
                                 try:
                                     self._writer.write(frame)
                                 except Exception:
                                     pass
-                        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                        success, buf = cv2.imencode('.png', bgr)
+                        success, buf = cv2.imencode('.png', frame)
                         if success:
                             png_bytes = buf.tobytes()
                             b64 = base64.b64encode(png_bytes)
@@ -529,7 +729,26 @@ class VideoProcessor(threading.Thread):
                     now = time.time()
                     if now - last_ts >= 1.0:
                         fps = frame_count / (now - last_ts)
-                        self.status_callback(f"Streaming from camera {self.cam_index} - {fps:.1f} FPS")
+                        try:
+                            moving_second = (self._motion_frames_in_sec / max(1, self._frames_in_sec)) > self._motion_frames_ratio
+                        except Exception:
+                            moving_second = False
+                        # Optional full-body gate (requires both upper and lower body displacement)
+                        try:
+                            if self._motion_mode in ("full", "strict") and self._body_disp_frames > 0:
+                                upper_avg = self._upper_disp_sum / max(1, self._body_disp_frames)
+                                lower_avg = self._lower_disp_sum / max(1, self._body_disp_frames)
+                                body_ok = (upper_avg >= self._body_pix_thresh) and (lower_avg >= self._body_pix_thresh)
+                                moving_second = moving_second and body_ok
+                        except Exception:
+                            pass
+                        self.status_callback(f"Streaming from camera {self.cam_index} - {fps:.1f} FPS | MOVE={'1' if moving_second else '0'}")
+                        # reset second counters
+                        self._frames_in_sec = 0
+                        self._motion_frames_in_sec = 0
+                        self._upper_disp_sum = 0.0
+                        self._lower_disp_sum = 0.0
+                        self._body_disp_frames = 0
                         last_ts = now
                         frame_count = 0
         finally:
@@ -562,6 +781,20 @@ class App(tk.Tk):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.records_dir = os.path.join(base_dir, "saved-tracks")
         self.current_record_path: Optional[str] = None
+
+        # Session & calorie tracking
+        try:
+            self.user_weight_kg = float(os.environ.get("BT_WEIGHT_KG", "70"))
+        except Exception:
+            self.user_weight_kg = 70.0
+        try:
+            self.activity_met = float(os.environ.get("BT_ACTIVITY_MET", "3.0"))  # light activity default
+        except Exception:
+            self.activity_met = 3.0
+        self.overlay_calories: bool = True
+        self.session_start_ts: Optional[float] = None
+        self.session_active_seconds: int = 0
+        self._last_move_increment_sec: Optional[int] = None
 
         self._build_ui()
         # Populate cameras after UI loads
@@ -600,17 +833,70 @@ class App(tk.Tk):
         status_bar = ttk.Label(container, textvariable=self.status_var, anchor="w")
         status_bar.pack(fill=tk.X)
 
+        # Menu bar with Settings
+        try:
+            menubar = tk.Menu(self)
+            settings_menu = tk.Menu(menubar, tearoff=0)
+            settings_menu.add_command(label="Settings...", command=self.show_settings)
+            menubar.add_cascade(label="Settings", menu=settings_menu)
+            help_menu = tk.Menu(menubar, tearoff=0)
+            help_menu.add_command(label="Help", command=self.show_help)
+            menubar.add_cascade(label="Help", menu=help_menu)
+            self.config(menu=menubar)
+        except Exception:
+            pass
+
         # Size
         self.minsize(800, 600)
 
     def set_status(self, text: str):
         # Called from worker thread via thread-safe StringVar set using after
+        def _parse_move_and_maybe_increment():
+            if self.session_start_ts is None:
+                return
+            try:
+                idx = text.rfind("MOVE=")
+                if idx != -1:
+                    val = text[idx+5:idx+6]
+                    if val == '1':
+                        cur_sec = int(time.time())
+                        if self._last_move_increment_sec != cur_sec:
+                            self.session_active_seconds += 1
+                            self._last_move_increment_sec = cur_sec
+            except Exception:
+                pass
+        def _format_elapsed_and_calories() -> str:
+            if self.session_start_ts is None:
+                return ""
+            try:
+                elapsed_sec = max(0, int(time.time() - self.session_start_ts))
+                h = elapsed_sec // 3600
+                m = (elapsed_sec % 3600) // 60
+                s = elapsed_sec % 60
+                # Calories only accrue while moving (active seconds)
+                active_sec = max(0, int(self.session_active_seconds))
+                duration_hours_active = active_sec / 3600.0
+                kcal = self.activity_met * self.user_weight_kg * duration_hours_active
+                if h > 0:
+                    elapsed_str = f"{h:02d}:{m:02d}:{s:02d}"
+                else:
+                    elapsed_str = f"{m:02d}:{s:02d}"
+                return f" | Elapsed {elapsed_str} | {kcal:.1f} kcal"
+            except Exception:
+                return ""
         def _set():
-            self.status_var.set(text)
+            # Update active seconds based on MOVE flag if present
+            _parse_move_and_maybe_increment()
+            # Append session info if a session is active
+            extras = _format_elapsed_and_calories()
+            self.status_var.set(text + extras)
         try:
             self.after(0, _set)
         except Exception:
             pass
+
+    def get_active_seconds(self) -> int:
+        return int(self.session_active_seconds or 0)
 
     def on_new_frame(self, b64_png_bytes: bytes):
         # Update image on main thread
@@ -674,12 +960,21 @@ class App(tk.Tk):
             messagebox.showerror("Missing Dependency", "OpenCV (cv2) is not available." + details + "\n" + tip)
             return
 
+        # Start a new session timer for calorie estimation
+        self.session_start_ts = time.time()
+        self.session_active_seconds = 0
+        self._last_move_increment_sec = None
+
         self.stop_event.clear()
         self.processor = VideoProcessor(
             cam_index=cam_idx,
             frame_callback=self.on_new_frame,
             status_callback=self.set_status,
             stop_event=self.stop_event,
+            weight_kg=self.user_weight_kg,
+            activity_met=self.activity_met,
+            overlay_calories=self.overlay_calories,
+            active_seconds_provider=self.get_active_seconds,
         )
         self.processor.start()
         self.start_btn.config(state=tk.DISABLED)
@@ -722,6 +1017,31 @@ class App(tk.Tk):
                 self._stop_recording()
             except Exception:
                 pass
+        # Compute final session stats before clearing
+        final_msg = None
+        if self.session_start_ts is not None:
+            try:
+                elapsed_sec = max(0, int(time.time() - self.session_start_ts))
+                active_sec = max(0, int(self.session_active_seconds))
+                duration_hours_active = active_sec / 3600.0
+                kcal = self.activity_met * self.user_weight_kg * duration_hours_active
+                h = elapsed_sec // 3600
+                m = (elapsed_sec % 3600) // 60
+                s = elapsed_sec % 60
+                if h > 0:
+                    elapsed_str = f"{h:02d}:{m:02d}:{s:02d}"
+                else:
+                    elapsed_str = f"{m:02d}:{s:02d}"
+                ah = active_sec // 3600
+                am = (active_sec % 3600) // 60
+                a_s = active_sec % 60
+                if ah > 0:
+                    active_str = f"{ah:02d}:{am:02d}:{a_s:02d}"
+                else:
+                    active_str = f"{am:02d}:{a_s:02d}"
+                final_msg = f"Session: Elapsed {elapsed_str}, Active {active_str}, {kcal:.1f} kcal"
+            except Exception:
+                final_msg = None
         self.set_status("Stopping...")
         self.stop_event.set()
         # Wait a short while for the thread to finish
@@ -732,7 +1052,16 @@ class App(tk.Tk):
         self.refresh_btn.config(state=tk.NORMAL)
         self.cam_combo.config(state="readonly")
         self.record_btn.config(state=tk.DISABLED)
-        self.set_status("Stopped.")
+        # Clear session timer after computing
+        self.session_start_ts = None
+        if final_msg:
+            try:
+                messagebox.showinfo("Session Summary", final_msg)
+            except Exception:
+                pass
+            self.set_status(f"Stopped. {final_msg}")
+        else:
+            self.set_status("Stopped.")
 
     def on_close(self):
         try:
@@ -851,6 +1180,56 @@ class App(tk.Tk):
         self.record_btn.config(text="Record")
         self.current_record_path = None
 
+    def show_settings(self):
+        win = tk.Toplevel(self)
+        win.title("Settings")
+        win.transient(self)
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+        # Weight
+        ttk.Label(frm, text="Weight (kg):").grid(row=0, column=0, sticky="w", pady=4)
+        weight_var = tk.StringVar(value=str(self.user_weight_kg))
+        ttk.Entry(frm, textvariable=weight_var, width=10).grid(row=0, column=1, sticky="w", pady=4)
+        # MET
+        ttk.Label(frm, text="Activity MET:").grid(row=1, column=0, sticky="w", pady=4)
+        met_var = tk.StringVar(value=str(self.activity_met))
+        ttk.Entry(frm, textvariable=met_var, width=10).grid(row=1, column=1, sticky="w", pady=4)
+        # Overlay calories
+        overlay_var = tk.BooleanVar(value=self.overlay_calories)
+        ttk.Checkbutton(frm, text="Overlay calories on video", variable=overlay_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8,4))
+        # Buttons
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8,0))
+        def on_save():
+            try:
+                self.user_weight_kg = float(weight_var.get())
+            except Exception:
+                try:
+                    messagebox.showwarning("Invalid Value", "Weight must be a number.")
+                except Exception:
+                    pass
+                return
+            try:
+                self.activity_met = float(met_var.get())
+            except Exception:
+                try:
+                    messagebox.showwarning("Invalid Value", "MET must be a number.")
+                except Exception:
+                    pass
+                return
+            self.overlay_calories = bool(overlay_var.get())
+            try:
+                messagebox.showinfo("Settings Saved", "Settings will apply to new streams. Stop/Start the stream to apply now.")
+            except Exception:
+                pass
+            win.destroy()
+        ttk.Button(btns, text="Save", command=on_save).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=6)
+
     def show_help(self):
         help_text = (
             "Body Tracker - Webcam Pose Scanner\n\n"
@@ -860,6 +1239,7 @@ class App(tk.Tk):
             "3. Click Start to begin scanning body movements.\n"
             "4. (Optional) Click Record to start/stop saving the video into the 'saved-tracks' folder.\n"
             "5. Click Stop to end the stream.\n\n"
+            "Tip: Use the Settings menu to adjust Weight (kg), Activity MET, and toggle the calories overlay.\n\n"
             "Dependencies:\n"
             "  Required: opencv-python\n"
             "  Optional: mediapipe (for holistic pose/face/hands), ultralytics (for YOLOv8/YOLOv10 Pose)\n\n"
@@ -868,7 +1248,15 @@ class App(tk.Tk):
             "- If MediaPipe is not installed but Ultralytics is, the app uses YOLO Pose to draw the body skeleton.\n"
             "- Without both, the app runs as a basic webcam viewer (no overlays).\n"
             "- If no cameras are found, ensure permissions are granted and no other app is using the camera.\n"
-            "- FPS and status appear at the bottom."
+            "- FPS, elapsed time, and calories appear at the bottom during a session.\n"
+            "- Elapsed time and calories overlay are drawn on the video and saved into recordings (if enabled in Settings).\n\n"
+            "Calories:\n"
+            "- Calories increase only when movement is detected. We estimate: MET * weight_kg * (active_seconds/3600).\n"
+            "- Configure via environment variables before starting:\n"
+            "    BT_WEIGHT_KG (default 70), BT_ACTIVITY_MET (default 3.0 for light activity).\n"
+            "- Motion detection thresholds (advanced): BT_MOTION_DIFF_THRESH (15), BT_MOTION_RATIO_THRESH (0.005), BT_MOTION_FRAMES_RATIO (0.1).\n"
+            "- Movement sensitivity mode: BT_MOTION_MODE=full|any (default: full). 'full' requires both upper (shoulders) and lower body (hips) to move; 'any' keeps the previous behavior.\n"
+            "- Full-body pixel threshold: BT_BODY_PIX_THRESH (default: 8). Increase to make MOVE harder to trigger; decrease to be more sensitive.\n"
         )
         messagebox.showinfo("Help", help_text)
 

@@ -9,6 +9,8 @@ Note: MediaPipe and Ultralytics are optional. If neither is installed, the app s
 - Start/stop live webcam preview
 - Record video to local files in a 'saved-tracks' folder
 - Status bar with basic runtime information
+- Calories overlay burned into the video while recording (elapsed time + kcal)
+- Settings menu to configure weight, MET, and whether to overlay calories
 - Optional MediaPipe support (if mediapipe is installed), with on-camera pose skeleton lines (shoulders/hips/midline)
 - Optional Ultralytics YOLO Pose support (if ultralytics is installed), automatically used when MediaPipe is unavailable
 - Cross‑platform: Windows, macOS, Linux (depending on available camera backends)
@@ -64,7 +66,8 @@ Steps:
 2. Choose a camera from the dropdown.
 3. Click “Start” to begin streaming; “Stop” to end.
 4. (Optional) Click “Record” to start/stop saving the current stream into the 'saved-tracks' folder.
-5. Use the “Help” button for quick guidance.
+5. Use the “Settings” menu to adjust Weight (kg), Activity MET, and toggle the calories overlay.
+6. Use the “Help” button for quick guidance.
 
 ### YOLO Pose configuration (optional)
 If Ultralytics is installed and MediaPipe is not, the app uses YOLO Pose automatically. You can tweak it via environment variables before launching:
@@ -90,6 +93,16 @@ High‑level code components (see main.py):
 - CameraEnumerator: scans indices and returns a list of working camera ids.
 - VideoProcessor (thread): grabs frames via OpenCV; uses MediaPipe if available, otherwise uses Ultralytics YOLO Pose if available; emits frames to the UI as base64 PNGs.
 - App (tk.Tk): builds the UI, manages start/stop, updates status, and displays frames.
+
+## Calories overlay and Settings
+- The app estimates calories as: MET × weight_kg × (active_seconds / 3600). Active seconds increase when movement is detected.
+- A calories overlay (elapsed time and kcal) is drawn on top of the video and is saved into the recorded file.
+- Use the Settings menu to configure:
+  - Weight (kg)
+  - Activity MET
+  - Toggle whether to overlay calories on the video
+
+Note: For advanced users, environment variables still work and can be set before launching the app.
 
 ## Troubleshooting
 - OpenCV not found or not working:
